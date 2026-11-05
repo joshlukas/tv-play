@@ -1,7 +1,7 @@
 # Maintainer: joshlukas
 pkgname=tv-play
 pkgver=1.0.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Videos und Bilder per AirPlay auf ein Apple TV streamen (mit Dolphin-Kontextmenü)"
 arch=('x86_64')
 url="https://github.com/joshlukas/tv-play"
@@ -9,7 +9,7 @@ license=('MIT')
 depends=(
   'python' 'python-aiohttp' 'python-cryptography' 'python-zeroconf' 'python-pydantic'
   'python-protobuf' 'python-requests' 'python-ifaddr' 'python-tabulate'
-  'python-chacha20poly1305-reuseable' 'python-cffi' 'avahi' 'ffmpeg'
+  'python-chacha20poly1305-reuseable' 'python-cffi' 'python-six' 'avahi' 'ffmpeg'
 )
 makedepends=('git' 'python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 optdepends=('konsole: Eintrag „Auf Apple TV abspielen“ im Dolphin-Rechtsklickmenü')
