@@ -1,0 +1,256 @@
+#!/usr/bin/env -S python3 -I
+"""tv-play – Videos und Bilder per AirPlay auf dem Apple TV abspielen.
+
+  tv-play --pair            einmalig koppeln (PIN wird am TV angezeigt)
+  tv-play video.mp4 ...     Video(s) nacheinander abspielen
+  tv-play bild1.jpg ...     Bilder als Diashow abspielen
+  tv-play --stop            Wiedergabe am TV beenden
+"""
+
+import sys
+from pathlib import Path
+
+# Mitgelieferte Bibliotheken (gepatchtes pyatv usw.) liegen in <prefix>/lib/tv-play/vendor
+VENDOR = Path(__file__).resolve().parent.parent / "lib" / "tv-play" / "vendor"
+if VENDOR.is_dir():
+    sys.path.insert(0, str(VENDOR))
+
+import argparse
+import asyncio
+import json
+import os
+import shutil
+import socket
+import subprocess
+import tempfile
+
+import pyatv
+from aiohttp import web
+from pyatv.const import Protocol
+from pyatv.storage.file_storage import FileStorage
+
+__version__ = "1.0.0"
+
+PORT = int(os.environ.get("TV_PLAY_PORT", "8099"))
+SLIDE_SECONDS = int(os.environ.get("TV_PLAY_SLIDE_SECONDS", "6"))
+CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "tv-play" / "config.json"
+
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".heic", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+DIRECT_CONTAINERS = {".mp4", ".m4v", ".mov"}
+DIRECT_VCODECS = {"h264", "hevc"}
+DIRECT_ACODECS = {"aac", "ac3", "eac3", "alac", None}
+
+
+def info(msg):
+    print(f"» {msg}", flush=True)
+
+
+def load_config():
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def avahi_hosts():
+    """IPv4-Adressen aller AirPlay-Geräte laut Avahi (pyatvs Multicast-Suche scheitert oft an Firewalls)."""
+    try:
+        out = subprocess.run(["avahi-browse", "-rtp", "_airplay._tcp"],
+                             capture_output=True, text=True, timeout=8).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    fields = (line.split(";") for line in out.splitlines() if line.startswith("="))
+    return sorted({f[7] for f in fields if len(f) > 7 and f[2] == "IPv4"})
+
+
+async def scan_devices(loop, storage):
+    hosts = avahi_hosts()
+    devices = await pyatv.scan(loop, storage=storage, timeout=5, hosts=hosts or None)
+    devices = [d for d in devices if d.get_service(Protocol.AirPlay)]
+    if not devices:
+        sys.exit("Kein AirPlay-Gerät im Netzwerk gefunden.")
+    return sorted(devices, key=lambda d: d.name.lower())
+
+
+def choose_device(devices, name, interactive):
+    if name:
+        for d in devices:
+            if d.name.lower() == name.lower():
+                return d
+        names = ", ".join(d.name for d in devices)
+        sys.exit(f"Gerät „{name}“ nicht gefunden. Verfügbar: {names}")
+    if len(devices) == 1:
+        return devices[0]
+    if not interactive:
+        names = ", ".join(d.name for d in devices)
+        sys.exit(f"Mehrere Geräte gefunden ({names}). Bitte mit -d NAME wählen oder tv-play --pair ausführen.")
+    for i, d in enumerate(devices, 1):
+        print(f"  {i}) {d.name} ({d.address})")
+    while True:
+        choice = input("Welches Gerät? Nummer eingeben: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(devices):
+            return devices[int(choice) - 1]
+
+
+async def pair(loop, storage, conf):
+    handler = await pyatv.pair(conf, Protocol.AirPlay, loop, storage=storage, name="tv-play")
+    await handler.begin()
+    pin = await loop.run_in_executor(None, input, f"PIN, der auf „{conf.name}“ angezeigt wird: ")
+    handler.pin(pin.strip())
+    await handler.finish()
+    await handler.close()
+    if not handler.has_paired:
+        sys.exit("Koppeln fehlgeschlagen.")
+    await storage.save()
+    save_config({**load_config(), "device": conf.name})
+    info(f"Gekoppelt mit {conf.name}. Ab jetzt: tv-play DATEI …")
+
+
+def probe(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)],
+        capture_output=True, text=True,
+    )
+    streams = json.loads(out.stdout or "{}").get("streams", [])
+    v = next((s["codec_name"] for s in streams if s["codec_type"] == "video"), None)
+    a = next((s["codec_name"] for s in streams if s["codec_type"] == "audio"), None)
+    return v, a
+
+
+def prepare_video(path, workdir):
+    """Gibt eine Datei zurück, die das Apple TV abspielen kann (ggf. umgewandelt)."""
+    vcodec, acodec = probe(path)
+    if vcodec is None:
+        sys.exit(f"{path.name}: keine Videospur gefunden.")
+    v_ok, a_ok = vcodec in DIRECT_VCODECS, acodec in DIRECT_ACODECS
+    if path.suffix.lower() in DIRECT_CONTAINERS and v_ok and a_ok:
+        return path
+
+    out = workdir / (path.stem + ".mp4")
+    if v_ok:
+        info(f"{path.name}: verpacke nach MP4 (schnell) …")
+        vargs = ["-c:v", "copy"] + (["-tag:v", "hvc1"] if vcodec == "hevc" else [])
+    else:
+        info(f"{path.name}: wandle {vcodec} → H.264 um (dauert etwas) …")
+        vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
+    aargs = ["-c:a", "copy"] if a_ok else ["-c:a", "aac", "-b:a", "192k"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", "-i", str(path),
+           "-map", "0:v:0", "-map", "0:a:0?", *vargs, *aargs, "-movflags", "+faststart", str(out)]
+    if subprocess.run(cmd).returncode != 0:
+        sys.exit(f"{path.name}: Umwandlung fehlgeschlagen.")
+    return out
+
+
+def make_slideshow(images, workdir):
+    info(f"Erstelle Diashow aus {len(images)} Bild(ern) …")
+    listfile = workdir / "bilder.txt"
+    lines = []
+    for img in images:
+        lines += [f"file '{str(img).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'",
+                  f"duration {SLIDE_SECONDS}"]
+    lines.append(lines[-2])  # letztes Bild nochmal, sonst ignoriert ffmpeg dessen Dauer
+    listfile.write_text("\n".join(lines) + "\n")
+    out = workdir / "diashow.mp4"
+    vf = ("scale=1920:1080:force_original_aspect_ratio=decrease,"
+          "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,fps=25,format=yuv420p")
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y",
+           "-f", "concat", "-safe", "0", "-i", str(listfile), "-vf", vf,
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-movflags", "+faststart", str(out)]
+    if subprocess.run(cmd).returncode != 0:
+        sys.exit("Diashow konnte nicht erstellt werden.")
+    return out
+
+
+def local_ip(target):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((target, 7000))
+        return s.getsockname()[0]
+
+
+async def serve(files):
+    """Stellt die Dateien per HTTP (mit Range-Support) fürs Apple TV bereit."""
+    routes = {f"/{i}{f.suffix.lower()}": f for i, f in enumerate(files)}
+
+    async def handler(request):
+        f = routes.get(request.path)
+        return web.FileResponse(f) if f else web.Response(status=404)
+
+    app = web.Application()
+    app.router.add_get("/{name}", handler)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    except OSError:
+        sys.exit(f"Port {PORT} ist belegt (läuft tv-play schon?).")
+    return runner, list(routes)
+
+
+async def main():
+    p = argparse.ArgumentParser(description="Videos/Bilder per AirPlay auf dem Apple TV abspielen.")
+    p.add_argument("files", nargs="*", type=Path)
+    p.add_argument("-d", "--device", help="Gerätename (Standard: das beim Koppeln gewählte Gerät)")
+    p.add_argument("--pair", action="store_true", help="mit einem Apple TV koppeln")
+    p.add_argument("--stop", action="store_true", help="Wiedergabe beenden")
+    p.add_argument("--version", action="version", version=f"tv-play {__version__}")
+    args = p.parse_args()
+    if not (args.files or args.pair or args.stop):
+        p.print_help()
+        return
+
+    missing = [f for f in args.files if not f.is_file()]
+    if missing:
+        sys.exit("Datei nicht gefunden: " + ", ".join(map(str, missing)))
+
+    loop = asyncio.get_running_loop()
+    storage = FileStorage.default_storage(loop)
+    await storage.load()
+    devices = await scan_devices(loop, storage)
+    name = args.device or os.environ.get("TV_PLAY_DEVICE") or (None if args.pair else load_config().get("device"))
+    conf = choose_device(devices, name, interactive=args.pair)
+
+    if args.pair:
+        await pair(loop, storage, conf)
+        return
+    if not conf.get_service(Protocol.AirPlay).credentials:
+        sys.exit(f"Noch nicht mit „{conf.name}“ gekoppelt. Bitte zuerst: tv-play --pair")
+
+    with tempfile.TemporaryDirectory(prefix="tv-play-") as tmp:
+        workdir = Path(tmp)
+        images = [f.resolve() for f in args.files if f.suffix.lower() in IMAGE_EXT]
+        videos = [prepare_video(f.resolve(), workdir) for f in args.files
+                  if f.suffix.lower() not in IMAGE_EXT]
+        if images:
+            videos.append(make_slideshow(images, workdir))
+
+        atv = await pyatv.connect(conf, loop, storage=storage)
+        try:
+            if args.stop:
+                await atv.remote_control.stop()
+                info("Gestoppt.")
+                return
+            runner, paths = await serve(videos)
+            base = f"http://{local_ip(str(conf.address))}:{PORT}"
+            try:
+                for path, src in zip(paths, videos):
+                    info(f"Spiele auf {conf.name}: {src.name}   (Strg+C zum Beenden)")
+                    await atv.stream.play_url(base + path)
+                info("Fertig.")
+            finally:
+                await runner.cleanup()
+        finally:
+            atv.close()
+
+
+if __name__ == "__main__":
+    if not shutil.which("ffprobe"):
+        sys.exit("ffmpeg/ffprobe wird benötigt.")
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nAbgebrochen.")

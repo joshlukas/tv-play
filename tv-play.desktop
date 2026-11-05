@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Service
+MimeType=video/*;image/*;
+Actions=tvPlay;
+X-KDE-Priority=TopLevel
+
+[Desktop Action tvPlay]
+Name=Auf Apple TV abspielen
+Icon=video-television
+Exec=konsole -e tv-play-konsole %F

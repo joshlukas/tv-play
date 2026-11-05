@@ -1,0 +1,7 @@
+#!/bin/sh
+# Startet tv-play für das Dolphin-Kontextmenü; bei Fehlern bleibt das Fenster offen.
+tv-play "$@" || {
+    echo
+    printf "Enter zum Schließen … "
+    read _
+}

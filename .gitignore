@@ -1,0 +1,6 @@
+pkg/
+src/
+dist/
+*.pkg.tar.zst
+*.whl
+pyatv/

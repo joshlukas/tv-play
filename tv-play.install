@@ -1,0 +1,19 @@
+_hint() {
+  cat <<'EOF'
+==> tv-play ist installiert.
+    1. Apple TV einmalig koppeln:   tv-play --pair
+    2. Falls eine Firewall (ufw) aktiv ist, Port 8099 fürs Heimnetz öffnen, z. B.:
+         sudo ufw allow from 192.168.0.0/16 to any port 8099 proto tcp
+    Danach: tv-play video.mp4   oder Rechtsklick in Dolphin → „Auf Apple TV abspielen“
+EOF
+}
+
+post_install() {
+  _hint
+}
+
+post_upgrade() {
+  # Nach einem Python-Update (z. B. 3.14 → 3.15) muss tv-play neu gebaut werden
+  python -I -c 'import sys; sys.path.insert(0, "/usr/lib/tv-play/vendor"); import pyatv, miniaudio' 2>/dev/null \
+    || echo "==> Warnung: tv-play passt nicht zur installierten Python-Version – bitte neue tv-play-Version abwarten."
+}
